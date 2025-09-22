@@ -1,0 +1,14 @@
+# Minimal deps for the Gemma-2 + SAE pipeline
+numpy>=1.26
+pandas>=2.0
+# Install the right CUDA build of torch separately if you need GPU; this pulls the CPU build by default.
+torch>=2.3
+transformers>=4.50
+huggingface_hub>=0.23
+sae-lens>=6.0
+# Needed for Gemma/Gemma2 tokenization on many setups
+sentencepiece>=0.1.99
+ipywidgets
+beautifulsoup4
+lxml
+boto3
