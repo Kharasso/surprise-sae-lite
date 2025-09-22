@@ -1,6 +1,20 @@
 export HF_HUB_TOKEN=...
 
 python process_10q_to_sae.py \
+  --csvs ./data/10q/index_2020_sp500.csv ./data/10q/index_2021_sp500.csv \
+  --raw-root ./edgar/raw_item2 \
+  --clean-root ./edgar/clean_item2 \
+  --out-root ./data/doc_features/10q_2b_canonical_16k \
+  --hf-model google/gemma-2-2b \
+  --sae-release gemma-scope-2b-pt-res-canonical \
+  --sae-id layer_12/width_16k/canonical \
+  --layer 12 \
+  --window 8192 \
+  --overlap 128 \
+  --batch-flush 100 \
+  --linearize-tables
+
+python process_10q_to_sae.py \
   --csvs ./data/10q/index_2012_sp500.csv \
   --raw-root ./edgar/raw_item2 \
   --clean-root ./edgar/clean_item2 \
