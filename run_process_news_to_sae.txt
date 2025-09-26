@@ -1,0 +1,11 @@
+export HF_HUB_TOKEN=...
+
+python process_news_to_sae.py \
+  --csvs ./data/news/news_2012_agg.csv \
+  --out-root ./data/doc_features/news_gemma9b_131k_trunc \
+  --hf-model google/gemma-2-9b \
+  --sae-release gemma-scope-9b-pt-res-canonical \
+  --sae-id layer_20/width_131k/canonical \
+  --layer 20 \
+  --window 8192 \
+  --truncate
