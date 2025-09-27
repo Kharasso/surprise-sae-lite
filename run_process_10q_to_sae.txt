@@ -58,3 +58,30 @@ python process_10q_to_sae.py \
   --overlap 128 \
   --batch-flush 100 \
   --linearize-tables
+
+
+
+
+python process_10q_to_llama_sae.py \
+  --csvs ./data/news/news_2012_agg.csv ./data/news/news_2013_agg.csv ./data/news/news_2014_agg.csv \
+  --out-root ./data/doc_features/news_llama31_8b_32x_new\
+  --hf-model meta-llama/Llama-3.1-8B \
+  --sae-hub EleutherAI/sae-llama-3.1-8b-32x \
+  --hookpoint layers.23.mlp \
+  --window 8192 \
+  --overlap 128 \
+  --batch-flush 100
+
+python process_10q_to_llama_sae.py \
+  --csvs ./data/10q/index_2020_sp500.csv ./data/10q/index_2021_sp500.csv \
+  --raw-root ./edgar/raw_item2 \
+  --clean-root ./edgar/clean_item2 \
+  --out-root ./data/doc_features/10q_llama31_8b_32x_l23mlp_2020_2021 \
+  --hf-model meta-llama/Meta-Llama-3.1-8B \
+  --sae-hub EleutherAI/sae-llama-3.1-8b-32x \
+  --hookpoint layers.23.mlp \
+  --hook-which out \
+  --window 8192 \
+  --overlap 128 \
+  --batch-flush 100 \
+  --linearize-tables

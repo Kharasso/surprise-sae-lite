@@ -12,3 +12,4 @@ ipywidgets
 beautifulsoup4
 lxml
 boto3
+eai-sparsify
