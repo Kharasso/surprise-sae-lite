@@ -24,8 +24,8 @@ python process_news_to_sae.py \
 
 
 python process_news_to_llama_sae.py \
-  --csvs ./data/news/news_2012_agg.csv ./data/news/news_2013_agg.csv ./data/news/news_2014_agg.csv \
-  --out-root ./data/doc_features/news_llama31_8b_32x_new\
+  --csvs ./data/news/news_2020_agg.csv ./data/news/news_2021_agg.csv \
+  --out-root ./data/doc_features/news_llama31_8b_32x_2020_2021\
   --hf-model meta-llama/Llama-3.1-8B \
   --sae-hub EleutherAI/sae-llama-3.1-8b-32x \
   --hookpoint layers.23.mlp \
