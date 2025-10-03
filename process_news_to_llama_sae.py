@@ -342,6 +342,7 @@ def main():
                 global_index[f"{sym}||{date}"] = doc_id
                 processed += 1
 
+
                 if processed % args.batch_flush == 0:
                     part += 1
                     npz_path = os.path.join(args.out_root, f"{prefix}_part{part}_features.npz")
