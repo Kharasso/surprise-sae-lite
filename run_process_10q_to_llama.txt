@@ -1,0 +1,13 @@
+python process_10q_to_llama_sae.py \
+  --csvs ./data/10q/index_2012_sp500.csv ./data/10q/index_2013_sp500.csv ./data/10q/index_2014_sp500.csv \
+  --raw-root ./edgar/raw_item2 \
+  --clean-root ./edgar/clean_item2 \
+  --out-root ./data/doc_features/10q_llama31_8b_32x \
+  --hf-model meta-llama/Llama-3.1-8B \
+  --sae-release llama_scope_lxr_32x \
+  --scope res \
+  --layer 20 \
+  --window 8192 \
+  --overlap 128 \
+  --batch-flush 100 \
+  --linearize-tables 

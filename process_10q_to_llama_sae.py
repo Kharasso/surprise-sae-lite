@@ -1,47 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-process_10q_to_sae_inmem_llama3_full_latent.py
-----------------------------------------------
-Build FULL-width SAE feature vectors for 10-Q reports using EleutherAI (sparsify) SAEs
-trained on Llama 3/3.1 hookpoints. Cleans and (optionally) linearizes tables in memory;
-writes only features (.npz) + metadata (.csv).
+process_10q_to_sae_llama31.py
+-----------------------------
+Same behavior as your original Gemma pipeline re: raw/clean I/O:
+- Open the raw TXT from --raw-root (or direct path fields from CSV).
+- If the cleaned file is NOT in --clean-root, clean + (optionally) linearize, then WRITE it there.
+- Always read/featurize the cleaned text.
+
+Only changes:
+- Switch to Llama-3.1-8B with Llama-Scope 32x SAEs (full 131,072-d latent).
+- SAE scope/layer handling (res/mlp/att), auto-build sae_id.
+- bfloat16 -> float32 safety when converting to NumPy.
+- Optional --tail-tokens and --max-rows (per-CSV).
+- Optional --torch-dtype for HF model load.
 
 Example:
-  python process_10q_to_sae_inmem_llama3_full_latent.py \
-    --csvs ./data/10q/index_2012.csv ./data/10q/index_2013.csv \
-    --raw-root . \
-    --out-root ./data/doc_features/10q_llama31_32x \
-    --hf-model meta-llama/Meta-Llama-3.1-8B \
-    --sae-hub EleutherAI/sae-llama-3.1-8b-32x \
+  python process_10q_to_sae_llama31.py \
+    --csvs ./data/10q/index_2012_sp500.csv ./data/10q/index_2013_sp500.csv ./data/10q/index_2014_sp500.csv \
+    --raw-root ./edgar/raw_item2 \
+    --clean-root ./edgar/clean_item2 \
+    --out-root ./data/doc_features/10q_llama31_8b_32x \
+    --hf-model meta-llama/Llama-3.1-8B \
+    --sae-release llama_scope_lxr_32x \
+    --scope res \
     --layer 20 \
-    --window 8192 --overlap 128 --batch-flush 100 \
-    --linearize-tables
+    --window 8192 \
+    --overlap 128 \
+    --batch-flush 100 \
+    --linearize-tables \
+    --tail-tokens 20000 \
+    --max-rows 50
 """
 import os, re, argparse, logging
 from typing import Optional, List
 import numpy as np, pandas as pd, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-# Your cleaners (kept as-is)
 from sae_text_cleaner import clean_text as external_clean_text
 from sae_table_linearizer import linearize_tables
 
-# --- EleutherAI sparsify SAE ---
 try:
-    from sparsify import Sae  # pip install sparsify
-    EAI_SAE_AVAILABLE = True
+    from sae_lens import SAE
+    SAE_LENS_AVAILABLE = True
 except Exception:
-    EAI_SAE_AVAILABLE = False
+    SAE_LENS_AVAILABLE = False
 
 
-# ---------------- Logging ----------------
+# ---------- Logging ----------
 def make_logger(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    logging.basicConfig(filename=path, filemode="w", level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-                        datefmt="%Y-%m-%d %H:%M:%S")
-    logger = logging.getLogger("10Q_Pipeline_InMem_Llama31")
+    logging.basicConfig(
+        filename=path, filemode="w", level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    logger = logging.getLogger("10Q_Pipeline_LLAMA31")
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
@@ -49,9 +62,9 @@ def make_logger(path):
     return logger
 
 
-# ---------------- Cleaning ----------------
+# ---------- Cleaning ----------
 def fallback_clean_text(text: str) -> str:
-    import re, unicodedata
+    import unicodedata
     text = unicodedata.normalize("NFC", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x0c", "")
     text = re.sub(r"(?<=\w)-\n(?=\w)", "", text)
@@ -72,7 +85,6 @@ def fallback_clean_text(text: str) -> str:
     return "\n".join(out).strip()
 
 def clean_text_generic(text: str) -> str:
-    # prefer your external cleaner
     try:
         return external_clean_text(text)
     except Exception:
@@ -96,7 +108,7 @@ def maybe_append_linearized_tables(cleaned_text: str, enable: bool) -> str:
     return cleaned_text + appendix
 
 
-# ---------------- Paths ----------------
+# ---------- Paths (PRESERVED BEHAVIOR) ----------
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
 def resolve_raw_path(raw_root: str, year: int, cik: str, filename: str) -> str:
@@ -109,55 +121,96 @@ def build_clean_path(clean_root: str, year: int, cik: str, filename: str) -> str
     out_dir = os.path.join(clean_root, str(year), str(cik)); ensure_dir(out_dir)
     return os.path.join(out_dir, base)
 
+# def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
-# ---------------- Models ----------------
-def load_models(hf_model: str, sae_hub_id: str, hookpoint: str, device: str, hf_token: Optional[str]):
-    if not EAI_SAE_AVAILABLE:
-        raise RuntimeError("EleutherAI 'sparsify' library not available. Run: pip install sparsify")
+# def resolve_raw_path(row: pd.Series, root: str) -> Optional[str]:
+#     """
+#     Original behavior: look for raw file in --raw-root using any of:
+#     ['local_path', 'relative_path', 'filename'] (if present).
+#     Try <root>/<value> and the bare <value> as fallback.
+#     """
+#     cands=[]
+#     for col in ["local_path", "relative_path", "filename"]:
+#         if col in row and pd.notna(row[col]):
+#             p=str(row[col]).replace("\\","/").strip()
+#             if p:
+#                 cands.append(os.path.join(root, p))
+#                 cands.append(p)
+#     for c in cands:
+#         if os.path.isfile(c):
+#             return c
+#     return None
 
+# def build_clean_path(clean_root: str, row: pd.Series) -> str:
+#     """
+#     Mirror your prior convention: /clean_root/<year>/<cik>/<basename>_cleaned.txt
+#     where basename comes from 'filename' or 'relative_path' or 'local_path'.
+#     """
+#     year = str(row.get("year") or "")
+#     cik  = str(row.get("cik") or "")
+#     # pick a name source in priority order
+#     name = (row.get("filename") or row.get("relative_path") or row.get("local_path") or "doc.txt")
+#     base = os.path.splitext(os.path.basename(str(name)))[0] + "_cleaned.txt"
+#     out_dir = os.path.join(clean_root, year, cik); ensure_dir(out_dir)
+#     return os.path.join(out_dir, base)
+
+
+# ---------- Llama-Scope SAE ----------
+def build_sae_id(scope: str, layer: int) -> str:
+    tag = {"res": "r", "mlp": "m", "att": "a"}[scope]
+    return f"l{layer}{tag}_32x"
+
+def str2dtype(s):
+    return {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}.get(s, None)
+
+def load_models(hf_model: str, sae_release: str, sae_id: str, device: str,
+                hf_token: Optional[str], torch_dtype_opt: str = "auto"):
+    if not SAE_LENS_AVAILABLE:
+        raise RuntimeError("sae_lens not available. `pip install sae-lens`.")
+    torch_dtype = str2dtype(torch_dtype_opt)  # None => auto
     model = AutoModelForCausalLM.from_pretrained(
-        hf_model,
-        token=hf_token,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
-        device_map=None,
+        hf_model, use_auth_token=hf_token, torch_dtype=torch_dtype
     ).to(device)
-    tokenizer = AutoTokenizer.from_pretrained(hf_model, token=hf_token)
-
-    sae = Sae.load_from_hub(sae_hub_id, hookpoint=hookpoint)
-    sae = sae.to(device if device.startswith("cuda") else "cpu")
-
+    tokenizer = AutoTokenizer.from_pretrained(hf_model, use_auth_token=hf_token)
+    sae = SAE.from_pretrained(
+        release=sae_release, sae_id=sae_id,
+        device=device if device.startswith("cuda") else "cpu",
+    )
     model.eval(); sae.eval(); torch.set_grad_enabled(False)
     return model, tokenizer, sae
 
 
-# ---------------- Hook Utils (for non-residual modules) ----------------
-def _resolve_module_by_path(root: torch.nn.Module, path: str) -> torch.nn.Module:
-    candidates = [path, "model." + path, "model.model." + path]
-    for cand in candidates:
-        cur = root; ok = True
-        for part in cand.split("."):
-            if not hasattr(cur, part):
-                ok = False; break
-            cur = getattr(cur, part)
-        if ok and isinstance(cur, torch.nn.Module):
-            return cur
-    raise AttributeError(f"Could not resolve module for hookpoint='{path}'")
+# ---------- Hooking ----------
+def gather_acts_llama(model, layer: int, inputs, scope: str):
+    """
+    scope: 'res' -> block output (resid_post)
+           'mlp' -> MLP output
+           'att' -> attention o_proj output
+    Returns [B,T,H] activations.
+    """
+    target = None
+    def _cap(_, __, out):
+        nonlocal target
+        target = out[0] if isinstance(out, (tuple, list)) else out
+        return out
 
-def capture_module_activations(mod: torch.nn.Module, inputs, which: str = "out"):
-    bucket = {"x": None}
-    def hook_fn(m, mod_in, mod_out):
-        if which == "in":
-            x = mod_in[0] if isinstance(mod_in, (tuple, list)) else mod_in
-        else:
-            x = mod_out[0] if isinstance(mod_out, (tuple, list)) else mod_out
-        bucket["x"] = x
-        return mod_out
-    h = mod.register_forward_hook(hook_fn)
-    _ = inputs  # no-op
-    return h, bucket
+    handles = []
+    layer_mod = model.model.layers[layer]
+    if scope == "res":
+        handles.append(layer_mod.register_forward_hook(_cap))
+    elif scope == "mlp":
+        handles.append(layer_mod.mlp.register_forward_hook(_cap))
+    elif scope == "att":
+        handles.append(layer_mod.self_attn.o_proj.register_forward_hook(_cap))
+    else:
+        raise ValueError("scope must be one of {'res','mlp','att'}")
+
+    _ = model(inputs)
+    for h in handles: h.remove()
+    return target
 
 
-# ---------------- Token chunking ----------------
+# ---------- Chunking & Featurization ----------
 def chunk_ids(input_ids: torch.Tensor, window: int, overlap: int) -> List[torch.Tensor]:
     T = input_ids.size(1)
     if T <= window:
@@ -166,138 +219,41 @@ def chunk_ids(input_ids: torch.Tensor, window: int, overlap: int) -> List[torch.
     while start < T:
         end = min(T, start + window)
         chunks.append(input_ids[:, start:end])
-        if end == T:
-            break
+        if end == T: break
         start = max(0, end - overlap)
     return chunks
 
-
-# ---------------- SAE helpers (densify Top-K) ----------------
-def _infer_latent_dim_from_sae(sae) -> int:
-    for path in ("decoder", "W_dec"):
-        mod = getattr(sae, path, None)
-        if mod is None: continue
-        w = getattr(mod, "weight", None)
-        if isinstance(w, torch.Tensor):
-            return int(w.shape[0])
-    for path in ("cfg", "config"):
-        cfg = getattr(sae, path, None)
-        if cfg is None: continue
-        for k in ("d_sae", "d_out", "n_features", "n_codes"):
-            v = getattr(cfg, k, None)
-            if isinstance(v, int) and v > 0: return int(v)
-    raise RuntimeError("Could not infer SAE latent dimension")
-
-def _encode_block(sae, activations: torch.Tensor) -> np.ndarray:
-    """
-    activations: [B, T, d] or [T, d]
-    returns dense np.ndarray [T, D_latent]
-    """
-    if activations.dim() == 3:
-        activations = activations.flatten(0, 1)
-    elif activations.dim() != 2:
-        raise ValueError(f"Unexpected activation shape {tuple(activations.shape)}")
-
-    with torch.no_grad():
-        out = sae.encode(activations)
-
-    # Dense first (some versions return a tensor or have dense fields)
-    for attr in ("activations", "encoded", "latent", "codes"):
-        if hasattr(out, attr):
-            lat = getattr(out, attr)
-            if isinstance(lat, torch.Tensor):
-                return lat.detach().cpu().numpy()
-    if isinstance(out, torch.Tensor):
-        return out.detach().cpu().numpy()
-    if isinstance(out, (tuple, list)) and out and isinstance(out[0], torch.Tensor):
-        return out[0].detach().cpu().numpy()
-
-    # Sparse Top-K path (indices + values)
-    idx = None; vals = None
-    for name in ("indices", "idx", "topk_indices", "feature_idx"):
-        if hasattr(out, name): idx = getattr(out, name); break
-    for name in ("values", "z", "topk_values"):
-        if hasattr(out, name): vals = getattr(out, name); break
-    if idx is None or vals is None:
-        raise TypeError(f"Unexpected SAE encode() output; attrs: {dir(out)}")
-
-    if vals.dim() == 1: vals = vals.unsqueeze(-1)
-    if idx.dim() == 1: idx = idx.unsqueeze(-1)
-
-    D_latent = _infer_latent_dim_from_sae(sae)
-    N = vals.size(0); device = vals.device
-    dense = torch.zeros((N, D_latent), dtype=vals.dtype, device=device)
-    dense.scatter_(1, idx.long(), vals)
-    return dense.detach().cpu().numpy()
-
-
-# ---------------- Featurization ----------------
-def featurize_text(
-    model,
-    sae,
-    tokenizer,
-    text: str,
-    device: str,
-    hookpoint: str,
-    layer_for_residual: Optional[int],
-    window: int,
-    overlap: int,
-    truncate: bool,
-    non_residual_capture: bool,
-    non_residual_which: str = "out",
-):
+def featurize_text(model, sae, tokenizer, text: str, device: str,
+                   layer: int, window: int, overlap: int, scope: str,
+                   tail_tokens: Optional[int] = None):
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=True, truncation=False)
     ids = enc.input_ids.to(device)
-    n_tokens = int(ids.size(1))
+    if tail_tokens is not None and ids.size(1) > tail_tokens:
+        ids = ids[:, -tail_tokens:]
 
-    chunks = [ids] if (truncate and n_tokens > window) else chunk_ids(ids, window, overlap)
+    chunks = chunk_ids(ids, window, overlap)
 
     sum_vec = None; max_vec = None; n_total = 0
-
     for ch in chunks:
-        with torch.inference_mode():
-            if not non_residual_capture:
-                # Fast path via hidden_states for residual stream
-                outputs = model(input_ids=ch, output_hidden_states=True)
-                hs = outputs.hidden_states  # [embed, layer0, layer1, ...]
-                if hookpoint == "embed_tokens":
-                    acts = torch.as_tensor(hs[0])
-                else:
-                    acts = torch.as_tensor(hs[layer_for_residual + 1])
-                if isinstance(acts, (tuple, list)): acts = acts[0]
-            else:
-                # Module capture (e.g., layers.X.mlp / .self_attn)
-                target = _resolve_module_by_path(model, hookpoint)
-                hook, bucket = capture_module_activations(target, ch, which=non_residual_which)
-                _ = model(ch)
-                hook.remove()
-                acts = bucket["x"]
-                if isinstance(acts, (tuple, list)): acts = acts[0]
-                if acts is None:
-                    raise RuntimeError(f"Failed to capture activations at '{hookpoint}'")
-
-            lat_np = _encode_block(sae, acts.to(device).float())  # [T, D_lat]
-            if lat_np.size == 0:
-                del acts
-                if device.startswith("cuda"): torch.cuda.empty_cache()
-                continue
-
-            n_total += lat_np.shape[0]
-            if sum_vec is None:
-                sum_vec = lat_np.sum(axis=0)
-                max_vec = lat_np.max(axis=0)
-            else:
-                sum_vec += lat_np.sum(axis=0)
-                max_vec = np.maximum(max_vec, lat_np.max(axis=0))
-
-            del acts, lat_np
-            if device.startswith("cuda"): torch.cuda.empty_cache()
+        with torch.no_grad():
+            acts_in = gather_acts_llama(model, layer, ch, scope=scope)        # [B,T,H]
+            acts_lat = sae.encode(acts_in.to(torch.float32))                  # [B,T,131072]
+            arr = acts_lat.to(torch.float32).detach().cpu().numpy().squeeze(0)
+        if arr.size == 0:
+            continue
+        n_total += arr.shape[0]
+        block_sum = arr.sum(axis=0)
+        block_max = arr.max(axis=0)
+        if sum_vec is None:
+            sum_vec = block_sum; max_vec = block_max
+        else:
+            sum_vec += block_sum; max_vec = np.maximum(max_vec, block_max)
+        del acts_in, acts_lat
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
     if n_total == 0:
-        try:
-            D = _infer_latent_dim_from_sae(sae)
-        except Exception:
-            D = 0
+        D = int(getattr(sae, "d_sae", 0) or (sae.W_dec.weight.shape[0] if hasattr(sae, "W_dec") else 0))
         Z = np.zeros((D,), np.float32)
         return Z, Z.copy(), Z.copy(), 0
 
@@ -305,36 +261,37 @@ def featurize_text(
     return sum_vec.astype(np.float32), mean_vec, max_vec.astype(np.float32), int(n_total)
 
 
-# ---------------- Main ----------------
+# ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csvs", nargs="+", required=True)
     ap.add_argument("--raw-root", default="./edgar/raw_item2")
     ap.add_argument("--clean-root", default="./edgar/clean_item2")
-    ap.add_argument("--out-root", default="./data/doc_features/10q_llama31_32x")
+    ap.add_argument("--out-root", default="./data/doc_features/10q_llama31_8b_32x")
+    ap.add_argument("--hf-model", default="meta-llama/Llama-3.1-8B")
 
-    # Model + SAE (EleutherAI) config
-    ap.add_argument("--hf-model", default="meta-llama/Meta-Llama-3.1-8B")
-    ap.add_argument("--sae-hub", default="EleutherAI/sae-llama-3.1-8b-32x",
-                    help="HF repo id that contains SAEs per hookpoint")
-    ap.add_argument("--hookpoint", default="layers.20",
-                    help="Hookpoint matching the SAE, e.g. 'embed_tokens', 'layers.20', 'layers.20.mlp'")
+    # Llama-Scope 32x defaults (residual)
+    ap.add_argument("--sae-release", default="llama_scope_lxr_32x",
+                    help="Choose among llama_scope_lxr_32x (res), llama_scope_lxm_32x (mlp), llama_scope_lxa_32x (att)")
+    ap.add_argument("--sae-id", default=None,
+                    help="If omitted, auto from --layer and --scope (e.g., l20r_32x)")
+    ap.add_argument("--scope", choices=["res", "mlp", "att"], default="res",
+                    help="Hookpoint family (residual/mlp/attn)")
 
-    # Convenience: residual fast path via --layer
-    ap.add_argument("--layer", type=int, default=None,
-                    help="If set, overrides --hookpoint to 'layers.{layer}' for residual stream")
-
-    # Windowing
+    ap.add_argument("--layer", type=int, default=20)
     ap.add_argument("--window", type=int, default=8192)
     ap.add_argument("--overlap", type=int, default=128)
     ap.add_argument("--batch-flush", type=int, default=100)
-
-    # System + options
     ap.add_argument("--device", default=None)
     ap.add_argument("--linearize-tables", action="store_true")
 
-    # For non-residual modules, use input vs output capture
-    ap.add_argument("--hook-which", choices=["in", "out"], default="out")
+    # Extras to match your news pipeline
+    ap.add_argument("--max-rows", type=int, default=None,
+                    help="If set, only process the first N rows of each CSV (per file).")
+    ap.add_argument("--tail-tokens", type=int, default=None,
+                    help="If set, keep only the last N tokens per document before chunking.")
+    ap.add_argument("--torch-dtype", choices=["auto","float32","bfloat16","float16"], default="auto",
+                    help="Torch dtype to load the HF model with")
 
     args = ap.parse_args()
 
@@ -342,14 +299,14 @@ def main():
     os.makedirs(args.out_root, exist_ok=True)
     logger = make_logger(os.path.join(args.out_root, "process_10q_llama31.log"))
     logger.info(f"Device: {device}")
-
-    # Resolve capture point + residual fast path
-    hookpoint = f"layers.{args.layer}" if args.layer is not None else args.hookpoint
-    residual_fast_path = (hookpoint == "embed_tokens") or bool(re.fullmatch(r"layers\.\d+", hookpoint))
-    layer_for_residual = int(hookpoint.split(".")[1]) if (residual_fast_path and hookpoint != "embed_tokens") else None
+    logger.info(f"Scope: {args.scope}")
 
     hf_token = os.getenv("HF_HUB_TOKEN", None)
-    model, tokenizer, sae = load_models(args.hf_model, args.sae_hub, hookpoint, device, hf_token)
+    sae_id = args.sae_id or build_sae_id(args.scope, args.layer)
+    model, tokenizer, sae = load_models(
+        args.hf_model, args.sae_release, sae_id, device, hf_token, args.torch_dtype
+    )
+    logger.info(f"Loaded SAE release='{args.sae_release}', sae_id='{sae_id}' (d_sae≈{getattr(sae,'d_sae','unknown')})")
 
     for csv_path in args.csvs:
         prefix = os.path.splitext(os.path.basename(csv_path))[0]
@@ -358,6 +315,9 @@ def main():
 
         try:
             meta = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+            if args.max_rows is not None:
+                meta = meta.head(args.max_rows)
+                logger.info(f"Limiting to first {args.max_rows} rows for {csv_path}")
         except Exception as e:
             logger.exception(f"Failed to read {csv_path}: {e}"); continue
 
@@ -372,12 +332,16 @@ def main():
                 relative_path = (row.get("relative_path") or "").strip()
                 date_filed = (row.get("date_filed") or "").strip()
 
-                raw_path = resolve_raw_path(args.raw_root, year, cik, filename or relative_path)
+                # ---- ORIGINAL I/O BEHAVIOR ----
+                name_for_paths = (row.get("filename") or row.get("relative_path") or row.get("local_path") or "doc.txt")
+
+                raw_path = resolve_raw_path(args.raw_root, year, cik, name_for_paths)
                 if raw_path is None:
-                    logger.warning(f"[{idx}] Raw not found CIK={cik} file={filename}"); continue
+                    logger.warning(f"[{idx}] Raw not found CIK={cik} file={filename or relative_path}"); continue
 
-                clean_path = build_clean_path(args.clean_root, year, cik, filename or relative_path)
+                clean_path = build_clean_path(args.clean_root, year, cik, name_for_paths)
 
+                # If not already cleaned in clean-root, produce and write it there
                 if not os.path.isfile(clean_path):
                     with open(raw_path, "r", encoding="utf-8", errors="ignore") as f:
                         raw_text = f.read()
@@ -385,76 +349,72 @@ def main():
                     cleaned = maybe_append_linearized_tables(cleaned, args.linearize_tables)
                     with open(clean_path, "w", encoding="utf-8") as f:
                         f.write(cleaned)
-                else:
-                    with open(clean_path, "r", encoding="utf-8", errors="ignore") as f:
-                        cleaned = f.read()
-                    if args.linearize_tables and "TABLE_LINEARIZED" not in cleaned:
-                        cleaned2 = maybe_append_linearized_tables(cleaned, True)
-                        if cleaned2 != cleaned:
-                            with open(clean_path, "w", encoding="utf-8") as f:
-                                f.write(cleaned2)
-                            cleaned = cleaned2
+                # Always read from clean-root for featurization
+                with open(clean_path, "r", encoding="utf-8", errors="ignore") as f:
+                    cleaned = f.read()
 
-                # ---- Encode to FULL latent width ----
+                # ---- Featurize (full 131k; no top-k) ----
                 sum_vec, mean_vec, max_vec, ntok = featurize_text(
                     model, sae, tokenizer, cleaned, device,
-                    hookpoint=hookpoint,
-                    layer_for_residual=layer_for_residual,
-                    window=args.window, overlap=args.overlap, truncate=False,  # 10-Qs: usually chunked
-                    non_residual_capture=not residual_fast_path,
-                    non_residual_which=args.hook_which,
+                    args.layer, args.window, args.overlap, args.scope,
+                    tail_tokens=args.tail_tokens
                 )
-
                 X_sum.append(sum_vec); X_mean.append(mean_vec); X_max.append(max_vec); token_counts.append(ntok)
 
-                # Identity + metadata
-                base_name = os.path.splitext(os.path.basename(filename or relative_path or raw_path))[0]
-                doc_id = f"{cik}_{base_name}"
+                # Identity
+                chosen_name = filename or relative_path or row.get("local_path") or os.path.basename(raw_path)
+                doc_id = f"{cik}_{os.path.splitext(os.path.basename(str(chosen_name)))[0]}"
                 doc_ids.append(doc_id)
                 info_rows.append({
-                    "doc_id": doc_id, "cik": cik, "company": row.get("company",""), "form": row.get("form",""),
-                    "date_filed": date_filed, "quarter": row.get("quarter",""), "year": year,
-                    "url": row.get("url",""), "raw_path": raw_path, "clean_path": clean_path,
-                    "ntokens": ntok, "used_linearizer": bool(args.linearize_tables),
-                    "hf_model": args.hf_model, "sae_hub": args.sae_hub,
-                    "hookpoint": hookpoint, "residual_fast_path": residual_fast_path,
-                    "window": args.window, "overlap": args.overlap
+                    "doc_id": doc_id,
+                    "cik": cik,
+                    "company": row.get("company",""),
+                    "form": row.get("form",""),
+                    "date_filed": date_filed,
+                    "quarter": row.get("quarter",""),
+                    "year": year,
+                    "url": row.get("url",""),
+                    "raw_path": raw_path,
+                    "clean_path": clean_path,
+                    "ntokens": ntok,
+                    "used_linearizer": bool(args.linearize_tables),
+                    "hf_model": args.hf_model,
+                    "sae_release": args.sae_release,
+                    "sae_id": sae_id,
+                    "scope": args.scope,
+                    "layer": args.layer
                 })
 
                 processed += 1
+                logger.info(f"Processed file: {raw_path}")
+
                 if processed % args.batch_flush == 0:
                     part += 1
                     npz_path = os.path.join(args.out_root, f"{prefix}_part{part}_features.npz")
-                    np.savez(
-                        npz_path,
-                        X_sum=np.vstack(X_sum), X_mean=np.vstack(X_mean), X_max=np.vstack(X_max),
-                        token_counts=np.array(token_counts, np.int32), doc_ids=np.array(doc_ids, dtype=object),
-                    )
-                    pd.DataFrame(info_rows).to_csv(
-                        os.path.join(args.out_root, f"{prefix}_part{part}_meta.csv"), index=False
-                    )
-                    logging.getLogger("10Q_Pipeline_InMem_Llama31").info(f"Flushed part {part}: {processed} docs")
+                    np.savez(npz_path,
+                             X_sum=np.vstack(X_sum), X_mean=np.vstack(X_mean), X_max=np.vstack(X_max),
+                             token_counts=np.array(token_counts, np.int32), doc_ids=np.array(doc_ids, dtype=object))
+                    pd.DataFrame(info_rows).to_csv(os.path.join(args.out_root, f"{prefix}_part{part}_meta.csv"), index=False)
+                    logger.info(f"Flushed part {part}: {processed} docs")
                     X_sum.clear(); X_mean.clear(); X_max.clear(); token_counts.clear(); doc_ids.clear(); info_rows.clear()
-                    if device.startswith("cuda"): torch.cuda.empty_cache()
+                    if device.startswith("cuda"):
+                        torch.cuda.empty_cache()
 
             except Exception as e:
-                logging.getLogger("10Q_Pipeline_InMem_Llama31").exception(f"Row {idx} failed: {e}")
-                if device.startswith("cuda"): torch.cuda.empty_cache()
+                logger.exception(f"Row {idx} failed: {e}")
+                if device.startswith("cuda"):
+                    torch.cuda.empty_cache()
                 continue
 
         if len(doc_ids) > 0:
             part += 1
             npz_path = os.path.join(args.out_root, f"{prefix}_part{part}_features.npz")
-            np.savez(
-                npz_path,
-                X_sum=np.vstack(X_sum), X_mean=np.vstack(X_mean), X_max=np.vstack(X_max),
-                token_counts=np.array(token_counts, np.int32), doc_ids=np.array(doc_ids, dtype=object),
-            )
-            pd.DataFrame(info_rows).to_csv(
-                os.path.join(args.out_root, f"{prefix}_part{part}_meta.csv"), index=False
-            )
-            logging.getLogger("10Q_Pipeline_InMem_Llama31").info(f"Flushed FINAL part {part}")
-        logging.getLogger("10Q_Pipeline_InMem_Llama31").info(f"Finished CSV: {csv_path}")
+            np.savez(npz_path,
+                     X_sum=np.vstack(X_sum), X_mean=np.vstack(X_mean), X_max=np.vstack(X_max),
+                     token_counts=np.array(token_counts, np.int32), doc_ids=np.array(doc_ids, dtype=object))
+            pd.DataFrame(info_rows).to_csv(os.path.join(args.out_root, f"{prefix}_part{part}_meta.csv"), index=False)
+            logger.info(f"Flushed FINAL part {part}")
+        logger.info(f"Finished CSV: {csv_path}")
 
 
 if __name__ == "__main__":
