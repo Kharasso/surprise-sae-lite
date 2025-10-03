@@ -1,0 +1,14 @@
+export HF_HUB_TOKEN=...
+
+python process_news_to_llama_sae.py \
+  --csvs ./data/news/news_2012_agg.csv ./data/news/news_2013_agg.csv ./data/news/news_2014_agg.csv \
+  --out-root ./data/doc_features/news_llama31_8b_32x_2012_2014 \
+  --hf-model meta-llama/Llama-3.1-8B \
+  --sae-release llama_scope_lxm_32x \
+  --scope mlp \
+  --layer 23 \
+  --window 8192 \
+  --overlap 128 \
+  --batch-flush 100 \
+  --torch-dtype float32 \
+  --tail-tokens 20000
