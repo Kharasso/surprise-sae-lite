@@ -68,19 +68,33 @@ def build_sae_id(scope: str, layer: int) -> str:
     tag = {"res": "r", "mlp": "m", "att": "a"}[scope]
     return f"l{layer}{tag}_32x"
 
-def load_models(hf_model: str, sae_release: str, sae_id: str, device: str, hf_token: Optional[str]):
+# def load_models(hf_model: str, sae_release: str, sae_id: str, device: str, hf_token: Optional[str]):
+#     if not SAE_LENS_AVAILABLE:
+#         raise RuntimeError("sae_lens not available. `pip install sae-lens`.")
+#     model = AutoModelForCausalLM.from_pretrained(hf_model, use_auth_token=hf_token).to(device)
+#     tokenizer = AutoTokenizer.from_pretrained(hf_model, use_auth_token=hf_token)
+#     sae, _, _ = SAE.from_pretrained(
+#         release=sae_release,   # e.g., "llama_scope_lxr_32x"
+#         sae_id=sae_id,         # e.g., "l12r_32x"
+#         device=device if device.startswith("cuda") else "cpu",
+#     )
+#     model.eval(); sae.eval(); torch.set_grad_enabled(False)
+#     return model, tokenizer, sae
+def str2dtype(s):
+    return {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}.get(s, None)
+
+def load_models(hf_model, sae_release, sae_id, device, hf_token, torch_dtype_opt="auto"):
     if not SAE_LENS_AVAILABLE:
         raise RuntimeError("sae_lens not available. `pip install sae-lens`.")
-    model = AutoModelForCausalLM.from_pretrained(hf_model, use_auth_token=hf_token).to(device)
+    torch_dtype = str2dtype(torch_dtype_opt)  # None == auto
+    model = AutoModelForCausalLM.from_pretrained(
+        hf_model, use_auth_token=hf_token, torch_dtype=torch_dtype
+    ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(hf_model, use_auth_token=hf_token)
-    sae, _, _ = SAE.from_pretrained(
-        release=sae_release,   # e.g., "llama_scope_lxr_32x"
-        sae_id=sae_id,         # e.g., "l12r_32x"
-        device=device if device.startswith("cuda") else "cpu",
-    )
+    sae = SAE.from_pretrained(release=sae_release, sae_id=sae_id,
+                              device=device if device.startswith("cuda") else "cpu")
     model.eval(); sae.eval(); torch.set_grad_enabled(False)
     return model, tokenizer, sae
-
 
 # ---- Hooks (residual, mlp_out, attn_out) ----
 def gather_acts_llama(model, layer: int, inputs, scope: str):
@@ -144,9 +158,16 @@ def chunk_ids(input_ids: torch.Tensor, window: int, overlap: int) -> List[torch.
 
 # ---- Featurization (dense 131k; no top-k trimming) ----
 def featurize_text(model, sae, tokenizer, text: str, device: str,
-                   layer: int, window: int, overlap: int, truncate: bool, scope: str):
+                   layer: int, window: int, overlap: int, truncate: bool, scope: str,
+                   tail_tokens: int = None):
+
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=True, truncation=False)
     ids = enc.input_ids.to(device)
+
+    # --- NEW: keep only the last N tokens, if requested ---
+    if tail_tokens is not None and ids.size(1) > tail_tokens:
+        ids = ids[:, -tail_tokens:]
+
     n_tokens = int(ids.size(1))
 
     if truncate and n_tokens > window:
@@ -161,8 +182,10 @@ def featurize_text(model, sae, tokenizer, text: str, device: str,
         with torch.no_grad():
             acts_in = gather_acts_llama(model, layer, ch, scope=scope)   # [B,T,H]
             # SAE.encode returns full-width dense activations shaped [B,T,D_sae] (sparse but dense tensor)
-            acts_lat = sae.encode(acts_in.float())
-            arr = acts_lat.detach().cpu().numpy().squeeze(0)  # [T, D_sae]
+            # acts_lat = sae.encode(acts_in.float())
+            acts_lat = sae.encode(acts_in.to(torch.float32))
+            # arr = acts_lat.detach().cpu().numpy().squeeze(0)  # [T, D_sae]
+            arr = acts_lat.to(torch.float32).detach().cpu().numpy().squeeze(0) 
         if arr.size == 0:
             continue
         n_total += arr.shape[0]
@@ -227,6 +250,12 @@ def main():
     ap.add_argument("--truncate", action="store_true", help="If set, truncate to --window instead of chunking")
     ap.add_argument("--max-rows", type=int, default=None,
                 help="If set, only process the first N rows of each CSV (per file).")
+    ap.add_argument("--torch-dtype", choices=["auto","float32","bfloat16","float16"], default="auto",
+                help="Torch dtype to load the HF model with")
+    ap.add_argument(
+    "--tail-tokens", type=int, default=None,
+    help="If set, only process the last N tokens of each document (applied before chunking)."
+)
     args = ap.parse_args()
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -238,7 +267,10 @@ def main():
 
     hf_token = os.getenv("HF_HUB_TOKEN", None)
     sae_id = args.sae_id or build_sae_id(args.scope, args.layer)
-    model, tokenizer, sae = load_models(args.hf_model, args.sae_release, sae_id, device, hf_token)
+    # model, tokenizer, sae = load_models(args.hf_model, args.sae_release, sae_id, device, hf_token)
+    model, tokenizer, sae = load_models(
+    args.hf_model, args.sae_release, sae_id, device, hf_token, args.torch_dtype
+)
     logger.info(f"Loaded SAE release='{args.sae_release}', sae_id='{sae_id}' (d_sae≈{getattr(sae, 'd_sae', 'unknown')})")
 
     global_index = {}
@@ -269,17 +301,25 @@ def main():
         processed = 0; part = 0
 
         for idx, row in df.iterrows():
+           
             try:
                 sym = normalize_symbol(row.get(args.symbol_col, ""))
                 date = normalize_date(row.get(args.date_col, ""))
                 text = row.get(args.text_col, "")
+                logger.info(f"Processing symbol: {sym}, date: {date}")
                 if not text or not sym or not date:
                     logging.warning(f"[{idx}] Skipping empty fields sym={sym} date={date}")
                     continue
-
+                
+                # sum_vec, mean_vec, max_vec, ntok = featurize_text(
+                #     model, sae, tokenizer, text, device, args.layer, args.window, args.overlap, args.truncate, args.scope
+                # )
                 sum_vec, mean_vec, max_vec, ntok = featurize_text(
-                    model, sae, tokenizer, text, device, args.layer, args.window, args.overlap, args.truncate, args.scope
+                    model, sae, tokenizer, text, device,
+                    args.layer, args.window, args.overlap, args.truncate, args.scope,
+                    tail_tokens=args.tail_tokens
                 )
+
                 X_sum.append(sum_vec); X_mean.append(mean_vec); X_max.append(max_vec); token_counts.append(ntok)
 
                 doc_id = f"{sym}_{date}"
