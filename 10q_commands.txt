@@ -1,0 +1,11 @@
+export HF_HUB_TOKEN=xxxxx
+
+
+
+python process_10q_hidden_states.py \
+  --csvs ./edgar/meta/10q_2012.csv ./edgar/meta/10q_2013.csv ./edgar/meta/10q_2014.csv \
+  --raw-root ./edgar/raw_item2 \
+  --clean-root ./edgar/clean_item2 \
+  --out-root ./data/doc_features/10q_9b_hidden_states \
+  --hf-model google/gemma-2-9b \
+  --window 4096 --overlap 128 --linearize-tables
